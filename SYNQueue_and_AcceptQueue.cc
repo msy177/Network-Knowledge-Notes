@@ -119,13 +119,23 @@ int main(){
         return -1;
     }
 
-    n = listen(sockfd,128);//这里第三个参数是全连接队列的总容量 如果=0的话 三次握手可以成功建立连接，但是无法从里面accept取出连接
+    n = listen(sockfd,5000);//这里第三个参数是全连接队列的总容量 如果=0的话 三次握手可以成功建立连接，但是无法从里面accept取出连接
     if( n ==-1 ){
         perror("listen fail!");
         return -1;
     }
-
+    sleep(15);
     while(1){
+        socklen_t addrlen;
+        struct sockaddr_in peeraddr;
+        memset(&peeraddr,0,sizeof(sockaddr_in));
+        int fd = accept(sockfd,(struct sockaddr*)&peeraddr,&addrlen);
+        if(fd == -1){
+            perror("accept a connetcion fail! \n");
+        }
+        else{
+            std::cout<<"accept a connection success! fd is :"<<fd<<std::endl;
+        }
         sleep(1);
     }
     
@@ -185,5 +195,110 @@ int main(){
 
 
 TCP全连接队列的最大值取决于somaxconn的值和backlog的值的最小值
+看源码可知 /net/socket.c
+SYSCALL_DEFINE2(listen, int, fd, int, backlog)
+{
+	struct socket *sock;
+	int err, fput_needed;
+	int somaxconn;
+
+	sock = sockfd_lookup_light(fd, &err, &fput_needed);
+	if (sock) {
+		somaxconn = sock_net(sock->sk)->core.sysctl_somaxconn;
+		if ((unsigned)backlog > somaxconn)
+			backlog = somaxconn; //如果backlog的值大于somaxconn系统参数  就改变一下 somaxconn是内核参数 一般默认128
+
+		err = security_socket_listen(sock, backlog);
+		if (!err)
+			err = sock->ops->listen(sock, backlog);
+
+		fput_light(sock->file, fput_needed);
+	}
+	return err;
+}
+所以就是说 我们是取两者最小值，所以你的backlog参数即使再大，如果超过了内核参数somaxconn也就无效了
+可以通过指令查看我们当前的内核参数
+msy@msy-virtual-machine:~/Network-Knowledge-Notes$ cat /proc/sys/net/core/somaxconn 
+4096
+msy@msy-virtual-machine:~/Network-Knowledge-Notes$ 
+这里看到是4096 所以我的backlog设置5000 那么ss查看到的全连接队列长度 还是4096是不变的
+也可以使用sysctl命令查看（sysctl是Linux用来管理内核参数的工具）
+@msy-virtual-machine:~/Network-Knowledge-Notes$ sysctl net.core.somaxconn
+net.core.somaxconn = 4096
+msy@msy-virtual-machine:~/Network-Knowledge-Notes$ 
+可以通过echo 5000 > /proc/sys/net/core/somaxconn 来改变内核参数
+
+
+在万级高并发场景下，如果全连接队列长度仅为128 那么可能会有一堆连接失败
+可以通过调大backlog，和调整内核参数的方式来解决，调到5000 一般就可以解决万级高并发了
+
+
+*/
+
+
+
+/*
+
+
+全连接队列说了，下面我们来看半连接队列
+半连接队列不能通过ss查看，但是我们可以通过查看SYN_RECV状态的连接 来拿到TCP半连接队列，因为进入SYN_RECV状态就是进入了半连接队列
+msy@msy-virtual-machine:~/Network-Knowledge-Notes$ sudo netstat -natp | grep SYN_RECV | wc -l
+0
+msy@msy-virtual-machine:~/Network-Knowledge-Notes$ 
+目前是0
+
+我们可以通过模拟 出来半连接队列溢出的场景
+
+比如客户端只发送SYN包，不发送ACK回应包，服务端就会有大量的SYN_RECV状态的半连接
+这就是所谓的SYN攻击，DDos攻击
+
+客户端使用hping3 模拟大量发送SYN包 不回应
+sudo hping3 -S -p 9999 --flood 127.0.0.1
+
+然后使用
+msy@msy-virtual-machine:~/Network-Knowledge-Notes$ sudo netstat -natp | grep SYN_RECV | wc -l
+2047
+msy@msy-virtual-machine:~/Network-Knowledge-Notes$ sudo netstat -natp | grep SYN_RECV | wc -l
+2047
+查看SYN_RECV的数量大小
+
+注意：客户端跟服务端同一台主机好像不行，必须两台不同的主机，因为可能tcp连接优化了‘
+
+TODO.....
+
+
+可以使用syncookie防范
+cat /proc/sys/net/ipv4/tcp_syncookies
+0 关闭
+1 当SYN半连接队列放不下 启用
+2 表示无条件启用
+这样就可以在不使用SYN半连接队列情况下 成功建立连接
+收到客户端SYN后，计算一个值，放在SYN+ACK包中，等待客户端返回ACK报文时，取出值验证，合法直接建立连接成功，中间不进入半连接队列
+也就是给客户端一个值，你给我返回响应我就知道你是谁了，就直接建立连接，而不是先放入半连接队列等待你的ACK
+这样可以防范攻击，满了也就不会丢弃新连接了 而且攻击方没有ACK 所以不会建立连接
+
+几种方法 增大半连接队列长度 开启syncookies 减少SYN+ACK重传次数
+但是增大半连接队列长度 不能单纯修改内核参数，还要增大somaxconn和backlog才行 否则无效单纯增大tcp_max_syn_backlog
+减少SYN+ACK重传次数是因为处于SYN+RECV后对方不响应就会尝试重发SYN+ACK,达到上限就断开连接
+所以修改次数为1次，这样快速的断开无效攻击连接
+可以通过echo 1 > /proc/sys/net/ipv4/tcp_synack_retries来设置
+msy@msy-virtual-machine:~$ cat /proc/sys/net/ipv4/tcp_synack_retries 
+5
+msy@msy-virtual-machine:~$ 
+我的默认是5次
+
+读者问：“syncookies 启用后就不需要半链接了？那请求的数据会存在哪里？”
+syncookies = 1 时，半连接队列满后，后续的请求就不会存放到半连接队列了，
+而是在第二次握手的时候，服务端会计算一个 cookie 值，放入到 SYN +ACK 包中的序列号发给客户端，客户端收到后并回 ack ，
+服务端就会校验连接是否合法，合法就直接把连接放入到全连接队列。
+
+
+还有一种办法处理SYN攻击，调大 netdev_max_backlog
+当网卡接收数据包的速度大于内核处理速度，就有一个队列保存这些数据包 默认1000 可以调成10000
+
+
+
+早期的linux内核 backlog是SYN队列 半连接队列大小
+后面内核2.2后就变成全连接队列大小了
 */
 
